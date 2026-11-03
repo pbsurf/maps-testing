@@ -1,0 +1,770 @@
+// Headless benchmark replay: loads the app's real scene against a fixed tile fixture, plays a scripted
+//  camera path over Paris in phases, and reports per-phase memory and counters as JSON.
+// - links tangram core with the null GL driver in tests/src/gl_mock.cpp (no GPU or X server)
+// - every frame first waits until no tile task is being fetched or built, so the set of tiles each frame
+//   sees, and so the work done on every thread, is independent of thread timing
+// - under callgrind, each phase is zeroed and dumped separately (CALLGRIND_DUMP_STATS_AT("<phase>"))
+// See testing/bench/README.md for usage.
+
+#include "map.h"
+#include "log.h"
+#include "scene/scene.h"
+#include "data/rasterSource.h"
+#include "labels/labelManager.h"
+#include "tile/tile.h"
+#include "tile/tileCache.h"
+#include "tile/tileManager.h"
+#include "util/asyncWorker.h"
+#include "util/elevationManager.h"
+#include "debug/benchCounters.h"
+
+#include "benchPlatform.h"
+#include "gl_mock.h"
+
+#include <malloc.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#if defined(__has_include)
+#if __has_include(<valgrind/callgrind.h>)
+#include <valgrind/callgrind.h>
+#define HAVE_CALLGRIND 1
+#endif
+#endif
+#ifndef HAVE_CALLGRIND
+#define CALLGRIND_ZERO_STATS
+#define CALLGRIND_DUMP_STATS_AT(s)
+#define RUNNING_ON_VALGRIND 0
+#endif
+
+// functions normally provided by the platform layer
+void TANGRAM_WakeEventLoop() {}
+
+namespace Tangram {
+
+BenchCounters g_benchCounters;
+
+void logStr(const std::string& msg) { fputs(msg.c_str(), stderr); }
+void setCurrentThreadPriority(int priority) {}
+void initGLExtensions() {}
+
+}
+
+using namespace Tangram;
+
+// Main thread work, in named functions so its cost can be separated from other threads in callgrind
+//  output (bench.py reads their inclusive cost); noinline keeps them visible in optimized builds
+extern "C" __attribute__((noinline)) uint32_t bench_main_frame(Map* map, float dt) {
+    MapState state = map->update(dt);
+    map->render();
+    return state.flags;
+}
+
+// frame split in two, so the replay can wait for tile workers between update and render (see frame())
+extern "C" __attribute__((noinline)) uint32_t bench_main_update(Map* map, float dt) {
+    return map->update(dt).flags;
+}
+
+extern "C" __attribute__((noinline)) void bench_main_render(Map* map) {
+    map->render();
+}
+
+extern "C" __attribute__((noinline)) void bench_main_load_scene(Map* map, SceneOptions* options) {
+    map->loadScene(std::move(*options), false);
+}
+
+namespace {
+
+constexpr float FRAME_DT = 1/60.0f;
+
+struct Args {
+    std::string assets = "assets";
+    std::string fixture;
+    std::string out;
+    std::string source;  // default: sources.last_source from config.default.yaml
+    std::vector<std::string> phases;  // default: all
+    std::string stopAfter;  // stop after this phase
+    bool fetch = false;
+    int workers = 2;
+    int width = 1600, height = 1000;
+    float pixelScale = 1.0f;
+    double settleTimeout = 60;  // seconds to wait for in-flight tile tasks before giving up
+};
+
+double nowSec(clockid_t clk) {
+    timespec ts;
+    clock_gettime(clk, &ts);
+    return ts.tv_sec + ts.tv_nsec*1E-9;
+}
+
+// /proc/self/status value in bytes (fields are in kB), e.g. "VmHWM", "VmRSS"
+size_t procStatus(const char* key) {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    size_t keylen = strlen(key);
+    while (std::getline(f, line)) {
+        if (line.compare(0, keylen, key) == 0 && line[keylen] == ':') {
+            return size_t(std::stoull(line.substr(keylen + 1)))*1024;
+        }
+    }
+    return 0;
+}
+
+// reset VmHWM (peak RSS) to current RSS (Linux >= 4.0)
+void resetPeakRss() {
+    FILE* f = fopen("/proc/self/clear_refs", "w");
+    if (f) { fputs("5", f); fclose(f); }
+}
+
+std::string jsonStr(const std::string& s) {
+    std::string r = "\"";
+    for (char c : s) {
+        if (c == '"' || c == '\\') { r += '\\'; r += c; }
+        else if (c == '\n') { r += "\\n"; }
+        else if (uint8_t(c) < 0x20) { char buf[8]; snprintf(buf, sizeof(buf), "\\u%04x", c); r += buf; }
+        else { r += c; }
+    }
+    return r + "\"";
+}
+
+// ordered list of key/value pairs written as a JSON object
+struct JsonObj {
+    std::vector<std::pair<std::string, std::string>> kv;
+    JsonObj& add(const std::string& k, const std::string& v) { kv.emplace_back(k, jsonStr(v)); return *this; }
+    JsonObj& add(const std::string& k, const char* v) { return add(k, std::string(v)); }
+    JsonObj& add(const std::string& k, double v) {
+        char buf[64];
+        if (v == std::floor(v) && std::fabs(v) < 1E15) { snprintf(buf, sizeof(buf), "%.0f", v); }
+        else { snprintf(buf, sizeof(buf), "%.6g", v); }
+        kv.emplace_back(k, buf);
+        return *this;
+    }
+    JsonObj& add(const std::string& k, bool v) { kv.emplace_back(k, v ? "true" : "false"); return *this; }
+    JsonObj& addRaw(const std::string& k, const std::string& v) { kv.emplace_back(k, v); return *this; }
+    std::string str(const std::string& indent = "") const {
+        std::string s = "{";
+        for (size_t i = 0; i < kv.size(); ++i) {
+            s += (i ? ",\n" : "\n") + indent + "  " + jsonStr(kv[i].first) + ": " + kv[i].second;
+        }
+        return s + "\n" + indent + "}";
+    }
+};
+
+std::string yamlToStr(const YAML::Node& node) {
+    if (node.IsScalar()) { return node.as<std::string>(); }
+    YAML::Writer emitter;
+    emitter.flowLevel = 10;
+    emitter.indent = 0;
+    return emitter.convert(node);
+}
+
+// Subset of the app's SourceBuilder (app/src/mapsources.cpp): vector scene layers and their updates.
+//  Raster url sources aren't supported since the default source doesn't use them.
+struct SceneBuilder {
+    const YAML::Node& sources;
+    std::vector<std::string> imports;
+    std::vector<SceneUpdate> updates;
+    std::vector<std::string> keys;
+
+    explicit SceneBuilder(const YAML::Node& s) : sources(s) {}
+
+    bool addLayer(const std::string& key) {
+        for (auto& k : keys) { if (k == key) return true; }
+        const YAML::Node& src = sources[key];
+        if (!src) { LOGE("Invalid map source %s", key.c_str()); return false; }
+        keys.push_back(key);
+        for (const auto& layer : src["layers"]) {
+            if (!addLayer(layer.IsMap() ? layer["source"].Scalar() : layer.Scalar())) { return false; }
+        }
+        if (src["url"]) {
+            LOGE("Raster source %s not supported by benchmark replay", key.c_str());
+            return false;
+        }
+        if (src["scene"]) { imports.push_back(src["scene"].Scalar()); }
+        for (const auto& upd : src["updates"].pairs()) {
+            updates.emplace_back("+" + upd.first.Scalar(), yamlToStr(upd.second));
+        }
+        for (const auto& upd : src["updates_vector"].pairs()) {
+            updates.emplace_back("+" + upd.first.Scalar(), yamlToStr(upd.second));
+        }
+        return true;
+    }
+};
+
+
+class Replay {
+public:
+    Args args;
+    YAML::Node config;
+    YAML::Node mapSources;
+    BenchPlatform* platform = nullptr;
+    std::unique_ptr<Map> map;
+    std::string sceneYaml;
+    std::vector<SceneUpdate> sceneUpdates;
+    std::string baseUrl;
+
+    // per-phase state
+    uint64_t frames = 0;
+    int totalFrames = 0;  // over all phases, for BENCH_DUMP_LABELS
+    LabelManager::Stats labelPeak = {0, 0, 0};
+    bool incomplete = false;
+    bool failed = false;
+    bool stopped = false;
+    std::vector<std::string> phaseResults;
+
+    explicit Replay(const Args& _args) : args(_args) {
+        // tile building is ~50x slower under valgrind
+        if (RUNNING_ON_VALGRIND) { args.settleTimeout *= 50; }
+    }
+
+    bool init();
+    bool buildScene(const std::string& source, bool terrain3D);
+    bool loadScene(bool terrain3D, double lng, double lat, float zoom);
+    void settle();
+    void drain(const std::function<void(std::function<void()>)>& enqueue, const char* name);
+    void setView(double lng, double lat, float zoom);
+    bool tasksInFlight();
+    MapState frame();
+    void waitComplete(int maxFrames = 1200);
+    void runFrames(int n, const std::function<void(float)>& step);
+    void runPhase(const std::string& name, const std::function<void()>& setup,
+                  const std::function<void()>& run);
+    bool wantPhase(const std::string& name) const;
+    void sampleLabels();
+    void run();
+    std::string headerJson() const;
+};
+
+bool Replay::init() {
+    std::string cfgPath = args.assets + "/config.default.yaml";
+    config = YAML::LoadFile(cfgPath);
+    if (!config) { LOGE("Unable to load %s", cfgPath.c_str()); return false; }
+    std::string srcPath = args.assets + "/mapsources.default.yaml";
+    mapSources = YAML::LoadFile(srcPath);
+    if (!mapSources) { LOGE("Unable to load %s", srcPath.c_str()); return false; }
+    if (args.source.empty()) { args.source = config["sources"]["last_source"].as<std::string>(""); }
+
+    char cwd[PATH_MAX];
+    std::string assetsAbs = args.assets;
+    if (assetsAbs[0] != '/' && getcwd(cwd, sizeof(cwd))) { assetsAbs = std::string(cwd) + "/" + assetsAbs; }
+    baseUrl = "file://" + assetsAbs + "/";
+
+    std::string requestLog = args.fetch ? args.fixture + "/requests.tsv" : "";
+    auto plat = std::make_unique<BenchPlatform>(args.fetch, requestLog);
+    plat->defaultUserAgent = "Tangram/1.0 (benchmark replay)";
+    platform = plat.get();
+    // like the app, render terrain depth on a separate "offscreen GL" thread (no context needed with gl_mock)
+    ElevationManager::offscreenWorker = std::make_unique<AsyncWorker>("Bench offscreen GL worker");
+    map = std::make_unique<Map>(std::move(plat));
+    map->setupGL();
+    map->resize(args.width, args.height);
+    map->setPixelScale(args.pixelScale);
+    return true;
+}
+
+// mirrors MapsSources::rebuildSource() and SourceBuilder::getSceneYaml()
+bool Replay::buildScene(const std::string& source, bool terrain3D) {
+    const YAML::Node& src = mapSources[source];
+    if (!src) { LOGE("Unknown map source %s", source.c_str()); return false; }
+    SceneBuilder builder(mapSources);
+    std::vector<SceneUpdate> srcUpdates;
+    if (src["layers"] && !src["scene"]) {
+        for (const auto& layer : src["layers"]) {
+            if (!builder.addLayer(layer.IsMap() ? layer["source"].Scalar() : layer.Scalar())) { return false; }
+        }
+        for (const auto& upd : src["updates"].pairs()) {
+            srcUpdates.emplace_back("+" + upd.first.Scalar(), yamlToStr(upd.second));
+        }
+    } else if (!builder.addLayer(source)) {
+        return false;
+    }
+    if (terrain3D) {
+        for (const auto& upd : config["terrain_3d"]["updates"].pairs()) {
+            builder.updates.emplace_back("+" + upd.first.Scalar(), yamlToStr(upd.second));
+        }
+    }
+    builder.updates.insert(builder.updates.end(), srcUpdates.begin(), srcUpdates.end());
+
+    auto addImport = [&](const std::string& url) {
+        sceneYaml += "  - " + (url.find("://") == std::string::npos ? baseUrl : "") + url + "\n";
+    };
+    sceneYaml = "import:\n";
+    for (const auto& imp : config["sources"]["common_imports"]) { addImport(imp.Scalar()); }
+    if (terrain3D) { addImport(config["terrain_3d"]["import"].as<std::string>()); }
+    for (auto& url : builder.imports) { addImport(url); }
+    sceneUpdates = std::move(builder.updates);
+    return true;
+}
+
+// mirrors MapsApp::loadSceneFile() and the scene completion handling in MapsApp::mapUpdate()
+bool Replay::loadScene(bool terrain3D, double lng, double lat, float zoom) {
+    if (!buildScene(args.source, terrain3D)) { return false; }
+    for (auto& upd : sceneUpdates) {
+        if (upd.value.c_str()[0] == '#') { upd.value = '"' + upd.value + '"'; }
+    }
+    SceneOptions options(sceneYaml, Url(baseUrl + "__GUI_SOURCES__"), false, sceneUpdates);
+    options.updates.push_back(SceneUpdate{"scene.elevation_source",
+        config["sources"]["elevation"][0].as<std::string>("")});
+    if (terrain3D) { options.updates.push_back(SceneUpdate{"scene.terrain_3d", "true"}); }
+    options.updates.push_back(SceneUpdate{"global.metric_units", "true"});
+    options.updates.push_back(SceneUpdate{"global.shuffle_seed", "0"});
+    options.updates.push_back(SceneUpdate{"global.selected_osm_id", "~"});
+    // the vector tile source has no disk cache in the app; the fixture needs one
+    options.updates.push_back(SceneUpdate{"+sources.osm.cache", "osm"});
+    options.diskTileCacheSize = 256*1024*1024;  // just > 0 to enable cache
+    options.diskCacheDir = args.fixture + "/";
+    // fixture tiles never expire (values > 2^30 are treated as absolute timestamps); sources with their own
+    //  max_age (elevation: 2 years) still expire, so refresh the fixture before then
+    options.diskTileCacheMaxAge = (int64_t(1) << 30) - 1;
+    options.preserveMarkers = true;
+    options.metricUnits = true;
+    for (const auto& font : config["fallback_fonts"]) {
+        options.fallbackFonts.push_back(FontSourceHandle(Url(args.assets + "/" + font.Scalar())));
+    }
+    options.numTileWorkers = args.workers;
+
+    bench_main_load_scene(map.get(), &options);
+    setView(lng, lat, zoom);
+    map->getScene()->tileManager()->setCacheSize(config["tile_cache_limit"].as<size_t>(512*1024*1024));
+
+    // run frames until the scene is complete (resources are read synchronously, so this is quick)
+    double t0 = nowSec(CLOCK_MONOTONIC);
+    while (!map->getScene()->isReady()) {
+        settle();
+        bench_main_frame(map.get(), FRAME_DT);
+        ++frames;
+        if (getenv("BENCH_VERBOSE")) {
+            LOG("loadScene frame: requests %d, builds %d", int(g_benchCounters.tileRequests),
+                int(g_benchCounters.tileBuilds.load()));
+        }
+        if (map->getScene()->isReady()) { break; }
+        if (nowSec(CLOCK_MONOTONIC) - t0 > args.settleTimeout) {
+            auto* err = map->getScene()->errors();
+            LOGE("Scene failed to load%s%s", err ? ": " : "", err ? err->update.path.c_str() : "");
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (terrain3D) {
+        auto* elevMgr = map->getScene()->elevationManager();
+        if (elevMgr) {
+            elevMgr->m_terrainScale = map->getScene()->config()["global"]["terrain_3d_scale"].as<float>(1.0f);
+        }
+    }
+    return true;
+}
+
+bool Replay::tasksInFlight() {
+    return map->getScene()->tileManager()->tasksInFlight();
+}
+
+// set zoom before position: the view constraint clamps latitude for the current zoom (at low zoom, the
+//  whole world must fill the viewport)
+void Replay::setView(double lng, double lat, float zoom) {
+    map->setZoom(zoom);
+    map->setPosition(lng, lat);
+}
+
+// wait (without running frames) until no dispatched tile task is still loading or building
+void Replay::settle() {
+    auto* tileMgr = map->getScene()->tileManager();
+    double t0 = nowSec(CLOCK_MONOTONIC);
+    while (tileMgr->tasksInFlight()) {
+        if (nowSec(CLOCK_MONOTONIC) - t0 > args.settleTimeout) {
+            LOGE("Timed out waiting for tile tasks");
+            failed = true;
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+    // ElevationManager skips the terrain depth pass for a frame if the previous one is still reading pixels
+    //  on the offscreen worker, so wait for it
+    if (auto& worker = ElevationManager::offscreenWorker) {
+        drain([&](std::function<void()> f){ worker->enqueue(std::move(f)); }, "offscreen worker");
+    }
+    // Map::loadScene deletes the old scene on the async worker; wait so that its GPU resources are always
+    //  released at the same point (otherwise e.g. gpu_tex_peak for terrain_load varies)
+    drain([&](std::function<void()> f){ map->runAsyncTask(std::move(f)); }, "async worker");
+}
+
+// wait until a single thread task queue has run everything enqueued before this call
+void Replay::drain(const std::function<void(std::function<void()>)>& enqueue, const char* name) {
+    auto m = std::make_shared<std::mutex>();
+    auto cv = std::make_shared<std::condition_variable>();
+    auto done = std::make_shared<bool>(false);
+    enqueue([=]() {
+        std::lock_guard<std::mutex> lock(*m);
+        *done = true;
+        cv->notify_all();
+    });
+    std::unique_lock<std::mutex> lock(*m);
+    if (!cv->wait_for(lock, std::chrono::duration<double>(args.settleTimeout), [&]{ return *done; })) {
+        LOGE("Timed out waiting for %s", name);
+        failed = true;
+    }
+}
+
+void Replay::sampleLabels() {
+    auto s = map->getScene()->labelManager()->stats();
+    labelPeak.labels = std::max(labelPeak.labels, s.labels);
+    labelPeak.obbs = std::max(labelPeak.obbs, s.obbs);
+    labelPeak.obbLabelsCapacity = std::max(labelPeak.obbLabelsCapacity, s.obbLabelsCapacity);
+}
+
+MapState Replay::frame() {
+    settle();
+    MapState state;
+    state.flags = bench_main_update(map.get(), FRAME_DT);
+    // update() dispatches tile tasks; wait for them before render, otherwise how many new glyphs the
+    //  glyph atlas upload in render picks up depends on worker timing. Results are only taken by the
+    //  next update(), so this doesn't change what the frame shows.
+    settle();
+    bench_main_render(map.get());
+    ++frames;
+    sampleLabels();
+    // BENCH_DUMP_LABELS=FILE: label entries after every frame, to find where two runs diverge
+    static FILE* labelDump = getenv("BENCH_DUMP_LABELS") ? fopen(getenv("BENCH_DUMP_LABELS"), "w") : nullptr;
+    if (labelDump) {
+        fprintf(labelDump, "== frame %d (%s)\n", totalFrames++, platform->phase().c_str());
+        map->getScene()->labelManager()->dumpLabels(labelDump);
+        fflush(labelDump);
+    }
+    return state;
+}
+
+// pause: run frames until all tiles are loaded and labels have stopped animating
+// - label fade-in only shows up in MapState the frame after tiles complete, so require two consecutive
+//   complete frames
+void Replay::waitComplete(int maxFrames) {
+    static bool verbose = getenv("BENCH_VERBOSE") != nullptr;
+    int ncomplete = 0;
+    for (int i = 0; i < maxFrames && !failed; ++i) {
+        MapState state = frame();
+        if (verbose) {
+            LOG("waitComplete frame %d: flags %x, labels %d, tiles loading %d, visible %d, requests %d, builds %d",
+                i, state.flags, int(map->getScene()->labelManager()->stats().labels),
+                map->getScene()->tileManager()->numLoadingTiles(),
+                int(map->getScene()->tileManager()->getVisibleTiles().size()),
+                int(g_benchCounters.tileRequests), int(g_benchCounters.tileBuilds.load()));
+        }
+        ncomplete = state.viewComplete() && !tasksInFlight() ? ncomplete + 1 : 0;
+        if (ncomplete >= 2) { return; }
+    }
+    LOGW("View still not complete after %d frames", maxFrames);
+    incomplete = true;
+}
+
+// run n frames, calling step(t) with t from 1/n to 1 before each one
+void Replay::runFrames(int n, const std::function<void(float)>& step) {
+    for (int i = 1; i <= n && !failed; ++i) {
+        step(float(i)/n);
+        frame();
+    }
+}
+
+bool Replay::wantPhase(const std::string& name) const {
+    if (args.phases.empty()) { return true; }
+    return std::find(args.phases.begin(), args.phases.end(), name) != args.phases.end();
+}
+
+void Replay::runPhase(const std::string& name, const std::function<void()>& setup,
+                      const std::function<void()>& run) {
+    if (failed || stopped) { return; }
+    if (name == args.stopAfter) { stopped = true; }
+    bool measure = wantPhase(name);
+    platform->setPhase(name);
+    // setup (camera jumps, settling) is not measured, but runs even for skipped phases so that later
+    //  phases start from the same state
+    if (setup) { setup(); }
+    if (!measure && !args.fetch) {
+        // skipped phase: still run it unmeasured so later phases see the same tile and label state
+        run();
+        return;
+    }
+
+    LOG("=== Phase %s", name.c_str());
+    frames = 0;
+    labelPeak = {0, 0, 0};
+    incomplete = false;
+    BenchCounters c0;
+    c0.collisionCandidates = g_benchCounters.collisionCandidates;
+    c0.proxyRasterLookups = g_benchCounters.proxyRasterLookups;
+    c0.tileRequests = g_benchCounters.tileRequests;
+    uint64_t builds0 = g_benchCounters.tileBuilds;
+    uint64_t net0 = platform->networkRequests, netfail0 = platform->networkFailures;
+    GLMockStats gl0 = glMockStats();
+    glMockResetPeaks();
+    resetPeakRss();
+    double wall0 = nowSec(CLOCK_MONOTONIC);
+    double cpu0 = nowSec(CLOCK_THREAD_CPUTIME_ID);
+    double pcpu0 = nowSec(CLOCK_PROCESS_CPUTIME_ID);
+
+    CALLGRIND_ZERO_STATS;
+    run();
+    CALLGRIND_DUMP_STATS_AT(name.c_str());
+
+    double cpu = nowSec(CLOCK_THREAD_CPUTIME_ID) - cpu0;
+    double pcpu = nowSec(CLOCK_PROCESS_CPUTIME_ID) - pcpu0;
+    double wall = nowSec(CLOCK_MONOTONIC) - wall0;
+    size_t rssPeak = procStatus("VmHWM");
+    size_t rss = procStatus("VmRSS");
+    struct mallinfo2 mi = mallinfo2();
+    const GLMockStats& gl = glMockStats();
+
+    auto* scene = map->getScene();
+    auto* tileMgr = scene->tileManager();
+    size_t visibleTileBytes = 0;
+    for (auto& tile : tileMgr->getVisibleTiles()) { visibleTileBytes += tile->getMemoryUsage(); }
+    size_t rasterBytes = 0, rasterTextures = 0;
+    for (auto& src : scene->tileSources()) {
+        if (!src->isRaster()) { continue; }
+        size_t n = 0;
+        rasterBytes += static_cast<RasterSource*>(src.get())->cacheMemoryUsage(&n);
+        rasterTextures += n;
+    }
+    double nf = std::max(uint64_t(1), frames);
+    uint64_t candidates = g_benchCounters.collisionCandidates - c0.collisionCandidates;
+    uint64_t proxyLookups = g_benchCounters.proxyRasterLookups - c0.proxyRasterLookups;
+
+    JsonObj r;
+    r.add("phase", name)
+     .add("frames", double(frames))
+     .add("complete", !incomplete && !failed)
+     .add("wall_s", wall)
+     .add("main_cpu_s", cpu)
+     .add("process_cpu_s", pcpu)
+     .add("heap_live", double(mi.uordblks))
+     .add("heap_arena", double(mi.arena + mi.hblkhd))
+     .add("heap_mmap", double(mi.hblkhd))
+     .add("rss", double(rss))
+     .add("rss_peak", double(rssPeak))
+     .add("gpu_tex_bytes", double(gl.textureBytes))
+     .add("gpu_buf_bytes", double(gl.bufferBytes))
+     .add("gpu_rb_bytes", double(gl.renderbufferBytes))
+     .add("gpu_tex_peak", double(gl.textureBytesPeak))
+     .add("gpu_buf_peak", double(gl.bufferBytesPeak))
+     .add("gpu_textures", double(gl.textures))
+     .add("gpu_buffers", double(gl.buffers))
+     .add("tex_uploads", double(gl.textureUploads - gl0.textureUploads))
+     .add("tex_upload_bytes", double(gl.textureUploadBytes - gl0.textureUploadBytes))
+     .add("buf_uploads", double(gl.bufferUploads - gl0.bufferUploads))
+     .add("buf_upload_bytes", double(gl.bufferUploadBytes - gl0.bufferUploadBytes))
+     .add("draw_calls_per_frame", (gl.drawCalls - gl0.drawCalls)/nf)
+     .add("visible_tiles", double(tileMgr->getVisibleTiles().size()))
+     .add("visible_tile_bytes", double(visibleTileBytes))
+     .add("tile_cache_bytes", double(tileMgr->getTileCache()->getMemoryUsage()))
+     .add("tile_cache_entries", double(tileMgr->getTileCache()->getNumEntries()))
+     .add("raster_cache_bytes", double(rasterBytes))
+     .add("raster_textures", double(rasterTextures))
+     .add("labels_peak", double(labelPeak.labels))
+     .add("obbs_peak", double(labelPeak.obbs))
+     .add("obb_labels_capacity", double(labelPeak.obbLabelsCapacity))
+     .add("collision_candidates", double(candidates))
+     .add("collision_candidates_per_frame", candidates/nf)
+     .add("proxy_raster_lookups", double(proxyLookups))
+     .add("proxy_raster_lookups_per_frame", proxyLookups/nf)
+     .add("tile_requests", double(g_benchCounters.tileRequests - c0.tileRequests))
+     .add("tile_builds", double(g_benchCounters.tileBuilds - builds0))
+     .add("network_requests", double(platform->networkRequests - net0));
+    if (args.fetch) { r.add("network_failures", double(platform->networkFailures - netfail0)); }
+    phaseResults.push_back(r.str("    "));
+    LOG("=== Phase %s: %d frames, main thread CPU %.2fs", name.c_str(), int(frames), cpu);
+}
+
+std::string Replay::headerJson() const {
+    JsonObj h;
+    h.add("mode", args.fetch ? "fetch" : "offline")
+     .add("fixture", args.fixture)
+     .add("source", args.source)
+     .add("workers", double(args.workers))
+     .add("width", double(args.width))
+     .add("height", double(args.height))
+     .add("pixel_scale", double(args.pixelScale))
+     .add("valgrind", bool(RUNNING_ON_VALGRIND))
+     .add("malloc_arena_max", getenv("MALLOC_ARENA_MAX") ? getenv("MALLOC_ARENA_MAX") : "");
+    return h.str("  ");
+}
+
+// The Paris script. Positions: (lng, lat).
+void Replay::run() {
+    const double PARIS_LNG = 2.352, PARIS_LAT = 48.857;
+
+    auto lerp = [](double a, double b, float t) { return a + (b - a)*t; };
+    auto panTo = [&](double lng0, double lat0, double lng1, double lat1, int n) {
+        runFrames(n, [&](float t) { map->setPosition(lerp(lng0, lng1, t), lerp(lat0, lat1, t)); });
+    };
+    auto zoomTo = [&](float z0, float z1, int n) {
+        runFrames(n, [&](float t) { map->setZoom(lerp(z0, z1, t)); });
+    };
+
+    // 1. startup and scene load, centered on Paris at z14
+    runPhase("startup", nullptr, [&]() {
+        if (!loadScene(false, PARIS_LNG, PARIS_LAT, 14)) { failed = true; return; }
+        waitComplete();
+    });
+
+    // 2. pan across central Paris at z15.5-16 (dense labels): west to east along the Seine, then south to
+    //  north from the Latin Quarter to Montmartre
+    runPhase("pan", nullptr, [&]() {
+        setView(2.2950, 48.8566, 15.5f);
+        waitComplete();
+        panTo(2.2950, 48.8566, 2.3950, 48.8566, 240);
+        waitComplete();
+        setView(2.3470, 48.8450, 16);
+        waitComplete();
+        panTo(2.3470, 48.8450, 2.3470, 48.8850, 240);
+        waitComplete();
+    });
+
+    // 3. zoom out to z10, then back in to z17
+    runPhase("zoom", nullptr, [&]() {
+        setView(PARIS_LNG, PARIS_LAT, 16);
+        zoomTo(16, 10, 180);
+        waitComplete();
+        zoomTo(10, 17, 210);
+        waitComplete();
+    });
+
+    // 5. idle: steady-state frames with nothing loading (2D, before switching to terrain mode)
+    runPhase("idle", [&]() {
+        setView(2.3376, 48.8606, 16);  // Louvre
+        waitComplete();
+    }, [&]() {
+        runFrames(300, [](float) {});
+    });
+
+    // 4. rotate and tilt in 3D terrain mode; scene reload is measured separately
+    runPhase("terrain_load", nullptr, [&]() {
+        if (!loadScene(true, PARIS_LNG, PARIS_LAT, 15)) { failed = true; return; }
+        waitComplete();
+    });
+
+    runPhase("terrain", nullptr, [&]() {
+        runFrames(180, [&](float t) {
+            map->setRotation(float(M_PI/2)*t);
+            map->setTilt(float(M_PI/3)*std::min(1.0f, t*1.5f));
+        });
+        waitComplete();
+        runFrames(120, [&](float t) { map->setRotation(float(M_PI/2)*(1 + t)); });
+        waitComplete();
+    });
+
+    // 6. missing rasters: elevation tiles at z >= 14 for this area are deleted from the fixture (see
+    //  bench/fixture.py prune), so tiles use proxy rasters from the z12-13 elevation tiles loaded in setup
+    runPhase("missing_rasters", [&]() {
+        map->setRotation(0);
+        map->setTilt(0);
+        setView(2.4350, 48.8350, 12.5f);  // Bois de Vincennes
+        waitComplete();
+    }, [&]() {
+        zoomTo(12.5f, 15.5f, 120);
+        panTo(2.4350, 48.8350, 2.4450, 48.8380, 60);
+        waitComplete();
+        runFrames(120, [](float) {});  // steady state on proxies
+    });
+}
+
+void usage() {
+    fprintf(stderr,
+        "Usage: replay --fixture DIR [options]\n"
+        "  --fixture DIR      tile fixture directory (mbtiles cache files)\n"
+        "  --fetch            download missing tiles into the fixture (logs requests to DIR/requests.tsv)\n"
+        "  --assets DIR       app assets directory (default: assets)\n"
+        "  --out FILE         write JSON results to FILE (default: stdout)\n"
+        "  --phases A,B,...   only measure these phases (others still run, unmeasured)\n"
+        "  --stop-after PHASE stop after this phase\n"
+        "  --source NAME      map source (default: sources.last_source in config.default.yaml)\n"
+        "  --workers N        tile worker threads (default: 2)\n"
+        "  --size WxH         viewport size (default: 1600x1000)\n"
+        "  --pixel-scale S    pixel scale (default: 1)\n"
+        "  --settle-timeout S seconds to wait for tile tasks (default: 60)\n");
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    Args args;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string {
+            if (i + 1 >= argc) { usage(); exit(2); }
+            return argv[++i];
+        };
+        if (a == "--fixture") { args.fixture = next(); }
+        else if (a == "--fetch") { args.fetch = true; }
+        else if (a == "--stop-after") { args.stopAfter = next(); }
+        else if (a == "--assets") { args.assets = next(); }
+        else if (a == "--out") { args.out = next(); }
+        else if (a == "--source") { args.source = next(); }
+        else if (a == "--workers") { args.workers = std::stoi(next()); }
+        else if (a == "--pixel-scale") { args.pixelScale = std::stof(next()); }
+        else if (a == "--settle-timeout") { args.settleTimeout = std::stod(next()); }
+        else if (a == "--size") {
+            std::string s = next();
+            if (sscanf(s.c_str(), "%dx%d", &args.width, &args.height) != 2) { usage(); return 2; }
+        }
+        else if (a == "--phases") {
+            std::stringstream ss(next());
+            std::string p;
+            while (std::getline(ss, p, ',')) { if (!p.empty()) { args.phases.push_back(p); } }
+        }
+        else { usage(); return 2; }
+    }
+    if (args.fixture.empty()) { usage(); return 2; }
+    if (access(args.fixture.c_str(), W_OK) != 0) {
+        fprintf(stderr, "Fixture directory %s does not exist or is not writable\n", args.fixture.c_str());
+        return 2;
+    }
+
+    Replay replay(args);
+    if (!replay.init()) { return 1; }
+    replay.run();
+
+    uint64_t netRequests = replay.platform->networkRequests;
+    uint64_t netFailures = replay.platform->networkFailures;
+    if (args.fetch) {
+        // MBTilesDataSource writes tiles to the cache on its own thread and drops queued writes when
+        //  destroyed, so give it time to finish
+        LOG("Waiting for tile cache writes...");
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+    replay.map.reset();
+    if (auto worker = std::move(ElevationManager::offscreenWorker)) {
+        worker->enqueue([](){ ElevationManager::shutdown(); });
+        worker->waitForCompletion();
+    }
+
+    std::string json = "{\n  \"run\": " + replay.headerJson() + ",\n  \"phases\": [\n";
+    for (size_t i = 0; i < replay.phaseResults.size(); ++i) {
+        json += (i ? ",\n    " : "    ") + replay.phaseResults[i];
+    }
+    json += "\n  ]\n}\n";
+    if (args.out.empty()) {
+        fputs(json.c_str(), stdout);
+    } else {
+        std::ofstream f(args.out);
+        f << json;
+    }
+
+    if (replay.failed) { return 1; }
+    if (args.fetch && netFailures > 0) {
+        fprintf(stderr, "%llu of %llu tile requests failed; run --fetch again to retry\n",
+                (unsigned long long)netFailures, (unsigned long long)netRequests);
+        return 1;
+    }
+    return 0;
+}
