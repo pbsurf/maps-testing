@@ -7,6 +7,7 @@ MODULE_BASE = $(MAKE_BASE)
 MODULE_SOURCES = \
   src/replay.cpp \
   src/benchPlatform.cpp \
+  src/counters.cpp \
   ../../tangram-es/tests/src/gl_mock.cpp \
   ../../tangram-es/platforms/common/urlClient.cpp
 

@@ -6,9 +6,13 @@
   bench.py prune --fixture DIR      delete elevation tiles for the missing_rasters phase
   bench.py callgrind --fixture DIR --out OUTDIR   per-phase callgrind profiles + summary.json
   bench.py memory --fixture DIR --out OUTDIR      native runs (memory, counters) + summary.json
+  bench.py perf --fixture DIR --out OUTDIR        native runs: per-phase hardware counters (and with
+                                                  --top N, sampled top functions) + summary.json
 """
 
 import argparse
+import bisect
+import collections
 import fcntl
 import glob
 import hashlib
@@ -30,7 +34,7 @@ PRUNE_MIN_ZOOM = 14
 # phases expected to request missing tiles in offline runs
 MISSING_OK_PHASES = {PRUNE_PHASE}
 # memory fields reported as median over runs (RSS and heap are slightly noisy); others must match exactly
-NOISY_FIELDS = {"wall_s", "main_cpu_s", "process_cpu_s", "heap_live", "heap_arena", "heap_mmap",
+NOISY_FIELDS = {"t_start", "t_end", "wall_s", "main_cpu_s", "process_cpu_s", "heap_live", "heap_arena", "heap_mmap",
                 "rss", "rss_peak"}
 
 
@@ -296,27 +300,113 @@ def cmd_memory(args):
               + (f"   nondeterministic: {', '.join(p['nondeterministic'])}" if "nondeterministic" in p else ""))
 
 
+# perf mode: exact per-phase counts from the replay's per-thread counters (--counters, perf_event_open);
+#  with --top, also perf record at a low rate for each phase's top functions (sampling at high rates is
+#  throttled in a VM and distorts cycles)
+COUNTER_FIELDS = ["instructions", "cycles", "branch_misses", "llc_misses", "l1d_misses"]
+COUNTER_GROUPS = ["main", "tile_worker", "other"]
+PERF_RECORD_HZ = 499
+PERF_LINE = re.compile(r"^\s*(\d+\.\d+):\s+(\d+)\s+\S+:\s+[0-9a-f]+\s+(.*)$")  # "time: period event: ip sym"
+
+
+def perf_functions(data, phases):
+    """Sampled cycles per function for each phase (samples between the phase's t_start and t_end)."""
+    starts = [p["t_start"] for p in phases]
+    out = {p["phase"]: collections.Counter() for p in phases}
+    proc = subprocess.Popen(["perf", "script", "-i", data, "--ns", "-F", "time,period,event,ip,sym"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+    for line in proc.stdout:
+        m = PERF_LINE.match(line)
+        if not m:
+            continue
+        t = float(m.group(1))
+        i = bisect.bisect_right(starts, t) - 1
+        if i >= 0 and t <= phases[i]["t_end"]:
+            out[phases[i]["phase"]][m.group(3).strip() or "[unknown]"] += int(m.group(2))
+    if proc.wait() != 0:
+        die(f"perf script failed on {data}")
+    return out
+
+
+def cmd_perf(args):
+    os.makedirs(args.out, exist_ok=True)
+    extra = ["--counters"] + (["--phases", args.phases] if args.phases else []) + \
+        (["--stop-after", args.stop_after] if args.stop_after else [])
+    runs = []
+    for i in range(args.runs):
+        data = os.path.join(args.out, f"perf.{i}.data")
+        wrapper = ["perf", "record", "-q", "-k", "monotonic", "-F", str(PERF_RECORD_HZ), "-e", "cycles:u",
+                   "-o", data, "--"] if args.top else None
+        rc, res = run_replay(args.fixture, extra, os.path.join(args.out, f"run{i}.json"), wrapper=wrapper)
+        if rc != 0:
+            die(f"run {i} failed")
+        misses = offline_check(res)
+        if misses:
+            print(f"WARNING: tiles missing from fixture: {misses}", file=sys.stderr)
+        runs.append((res, perf_functions(data, res["phases"]) if args.top else None))
+    phases = {}
+    for idx, p in enumerate(runs[0][0]["phases"]):
+        name = p["phase"]
+        ctrs = [r[0]["phases"][idx]["counters"] for r in runs]
+        ph = {"frames": p["frames"]}
+        totals = [{f: sum(c[g][f] for g in COUNTER_GROUPS) for f in COUNTER_FIELDS} for c in ctrs]
+        for f in COUNTER_FIELDS:
+            ph[f] = statistics.median(t[f] for t in totals)
+        for g in ("main", "tile_worker"):
+            for f in ("instructions", "cycles"):
+                ph[f"{g}_{f}"] = statistics.median(c[g][f] for c in ctrs)
+        ph["ipc"] = ph["instructions"] / max(ph["cycles"], 1)
+        for f in ("instructions", "cycles"):  # spread over runs, percent of median
+            vals = [t[f] for t in totals]
+            ph[f + "_range_pct"] = (max(vals) - min(vals)) / max(ph[f], 1) * 100
+        if any(c["multiplexed"] for c in ctrs):
+            ph["multiplexed"] = True  # counters shared hardware: counts are scaled estimates
+        if args.top:
+            funcs = sum((r[1][name] for r in runs), collections.Counter())
+            total = max(sum(funcs.values()), 1)
+            ph["top_functions"] = [{"function": fn, "cycles_pct": c / total * 100}
+                                   for fn, c in funcs.most_common(args.top)]
+        phases[name] = ph
+    summary = {"run": runs[0][0]["run"], "runs": args.runs, "fixture": fixture_info(args.fixture),
+               "phases": phases}
+    with open(os.path.join(args.out, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"{'phase':16s} {'instructions':>14s} {'range%':>6s} {'main instr':>13s} {'worker instr':>14s} "
+          f"{'cycles':>14s} {'range%':>6s} {'IPC':>5s} {'brM/kI':>6s} {'LLC/kI':>6s} {'L1D/kI':>6s}")
+    for name, p in phases.items():
+        ki = max(p["instructions"], 1) / 1000
+        print(f"{name:16s} {p['instructions']:>14,.0f} {p['instructions_range_pct']:6.2f} "
+              f"{p['main_instructions']:>13,.0f} {p['tile_worker_instructions']:>14,.0f} {p['cycles']:>14,.0f} "
+              f"{p['cycles_range_pct']:6.1f} {p['ipc']:5.2f} {p['branch_misses']/ki:6.2f} "
+              f"{p['llc_misses']/ki:6.2f} {p['l1d_misses']/ki:6.2f}" + ("  MULTIPLEXED" if p.get("multiplexed") else ""))
+        for fn in p.get("top_functions", []):
+            print(f"    {fn['cycles_pct']:5.1f}%  {fn['function'][:110]}")
+    return 0
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ["fetch", "id", "prune", "callgrind", "memory"]:
+    for name in ["fetch", "id", "prune", "callgrind", "memory", "perf"]:
         sp = sub.add_parser(name)
         sp.add_argument("--fixture", required=True)
         sp.add_argument("--workers", default="1",
                         help="tile worker threads (default 1: deterministic; tile workers share a glyph atlas)")
         if name == "fetch":
             sp.add_argument("--resume", action="store_true", help="continue an incomplete fetch")
-        if name in ("callgrind", "memory"):
+        if name in ("callgrind", "memory", "perf"):
             sp.add_argument("--out", required=True)
             sp.add_argument("--phases", help="comma separated phases to run and measure (default: all; others are skipped except scene loads)")
             sp.add_argument("--stop-after", help="stop after this phase")
-        if name == "memory":
+        if name in ("memory", "perf"):
             sp.add_argument("--runs", type=int, default=3)
+        if name == "perf":
+            sp.add_argument("--top", type=int, default=0,
+                            help="also sample with perf record and report the top N functions by self cycles per phase")
     args = ap.parse_args()
     global WORKERS
     WORKERS = args.workers
     rc = {"fetch": cmd_fetch, "id": cmd_id, "prune": cmd_prune, "callgrind": cmd_callgrind,
-          "memory": cmd_memory}[args.cmd](args)
+          "memory": cmd_memory, "perf": cmd_perf}[args.cmd](args)
     sys.exit(rc if isinstance(rc, int) else 0)
 
 

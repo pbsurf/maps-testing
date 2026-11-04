@@ -4,6 +4,8 @@
 // - every frame first waits until no tile task is being fetched or built, so the set of tiles each frame
 //   sees, and so the work done on every thread, is independent of thread timing
 // - under callgrind, each phase is zeroed and dumped separately (CALLGRIND_DUMP_STATS_AT("<phase>"))
+// - each phase's measured run is bounded by CLOCK_MONOTONIC t_start/t_end (for perf samples), and with
+//   --counters reports per-thread hardware counters for it (counters.cpp; bench.py perf)
 // See testing/bench/README.md for usage.
 
 #include "map.h"
@@ -18,9 +20,11 @@
 #include "util/elevationManager.h"
 
 #include "benchPlatform.h"
+#include "counters.h"
 #include "gl_mock.h"
 
 #include <malloc.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -57,7 +61,12 @@ namespace Tangram {
 
 
 void logStr(const std::string& msg) { fputs(msg.c_str(), stderr); }
-void setCurrentThreadPriority(int priority) {}
+// only TileWorker::run calls this, when a tile worker thread starts: name the thread (for perf record) and
+//  open its counters (--counters)
+void setCurrentThreadPriority(int priority) {
+    pthread_setname_np(pthread_self(), "tile_worker");
+    BenchCounters::addCurrentThread("tile_worker");
+}
 void initGLExtensions() {}
 
 }
@@ -110,6 +119,12 @@ double nowSec(clockid_t clk) {
     timespec ts;
     clock_gettime(clk, &ts);
     return ts.tv_sec + ts.tv_nsec*1E-9;
+}
+
+std::string fmtTime(double t) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.9f", t);
+    return buf;
 }
 
 // /proc/self/status value in bytes (fields are in kB), e.g. "VmHWM", "VmRSS"
@@ -496,9 +511,11 @@ void Replay::runPhase(const std::string& name, const std::function<void()>& setu
     double cpu0 = nowSec(CLOCK_THREAD_CPUTIME_ID);
     double pcpu0 = nowSec(CLOCK_PROCESS_CPUTIME_ID);
 
+    BenchCounters::begin();
     CALLGRIND_ZERO_STATS;
     run();
     CALLGRIND_DUMP_STATS_AT(name.c_str());
+    std::string counters = BenchCounters::endJson();
 
     double cpu = nowSec(CLOCK_THREAD_CPUTIME_ID) - cpu0;
     double pcpu = nowSec(CLOCK_PROCESS_CPUTIME_ID) - pcpu0;
@@ -526,6 +543,9 @@ void Replay::runPhase(const std::string& name, const std::function<void()>& setu
      .add("frames", double(frames))
      .add("complete", !incomplete && !failed)
      .add("wall_s", wall)
+     // CLOCK_MONOTONIC bounds of the measured run, to match perf samples (perf record -k monotonic)
+     .addRaw("t_start", fmtTime(wall0))
+     .addRaw("t_end", fmtTime(wall0 + wall))
      .add("main_cpu_s", cpu)
      .add("process_cpu_s", pcpu)
      .add("heap_live", double(mi.uordblks))
@@ -553,6 +573,7 @@ void Replay::runPhase(const std::string& name, const std::function<void()>& setu
      .add("raster_textures", double(rasterTextures))
      .add("labels_peak", double(labelsPeak))
      .add("network_requests", double(platform->networkRequests - net0));
+    if (BenchCounters::enabled()) { r.addRaw("counters", counters); }
     if (args.fetch) { r.add("network_failures", double(platform->networkFailures - netfail0)); }
     phaseResults.push_back(r.str("    "));
     LOG("=== Phase %s: %d frames, main thread CPU %.2fs", name.c_str(), int(frames), cpu);
@@ -580,6 +601,7 @@ std::string Replay::headerJson() const {
      .add("height", double(args.height))
      .add("pixel_scale", double(args.pixelScale))
      .add("valgrind", bool(RUNNING_ON_VALGRIND))
+     .add("counters", BenchCounters::enabled())
      .add("bench_env", benchEnv())
      .add("phases", [&]{ std::string p; for (auto& s : args.phases) { p += (p.empty() ? "" : ",") + s; } return p; }())
      .add("malloc_arena_max", getenv("MALLOC_ARENA_MAX") ? getenv("MALLOC_ARENA_MAX") : "");
@@ -679,13 +701,15 @@ void usage() {
         "  --workers N        tile worker threads (default: 2)\n"
         "  --size WxH         viewport size (default: 1600x1000)\n"
         "  --pixel-scale S    pixel scale (default: 1)\n"
-        "  --settle-timeout S seconds to wait for tile tasks (default: 60)\n");
+        "  --settle-timeout S seconds to wait for tile tasks (default: 60)\n"
+        "  --counters         per-phase hardware counters per thread group (perf_event_open)\n");
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
     Args args;
+    bool counters = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -694,6 +718,7 @@ int main(int argc, char* argv[]) {
         };
         if (a == "--fixture") { args.fixture = next(); }
         else if (a == "--fetch") { args.fetch = true; }
+        else if (a == "--counters") { counters = true; }
         else if (a == "--stop-after") { args.stopAfter = next(); }
         else if (a == "--assets") { args.assets = next(); }
         else if (a == "--out") { args.out = next(); }
@@ -718,6 +743,11 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
+    // before any other thread starts: the main thread's counters, then each tile worker opens its own
+    if (counters && !BenchCounters::enable()) {
+        fprintf(stderr, "--counters: hardware counters unavailable (kernel.perf_event_paranoid <= 2?)\n");
+        return 1;
+    }
     Replay replay(args);
     if (!replay.init()) { return 1; }
     replay.run();

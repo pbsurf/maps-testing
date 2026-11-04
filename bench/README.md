@@ -40,6 +40,7 @@ Elevation tiles keep their scene `max_age` (2 years); vector tiles never expire 
 
     testing/bench/bench.py callgrind --fixture FIXTURE --out OUTDIR
     testing/bench/bench.py memory --fixture FIXTURE --out OUTDIR [--runs 3]
+    testing/bench/bench.py perf --fixture FIXTURE --out OUTDIR [--runs 3] [--top N]
 
 `callgrind` runs the replay under `valgrind --tool=callgrind`; each phase is zeroed and dumped
 separately (`CALLGRIND_DUMP_STATS_AT("<phase>")`), giving one file per phase (`callgrind.out.N`; the
@@ -61,7 +62,32 @@ sizes, peak label count and `network_requests` (offline: tiles missing from the 
 memory fields are medians over the runs; other fields that differ
 between runs are listed as `nondeterministic`.
 
-Both pass `--workers 1` by default (one tile worker thread); use `--workers N` to change it. Use
+`perf` runs natively with `replay --counters`: the replay opens user-space hardware counters for each
+thread (`perf_event_open`: instructions, cycles, branch misses, last level cache misses, L1D load misses)
+and reads them at each phase's start and end, so phases cover the same work as callgrind's dumps (setup
+steps excluded). Counts are exact, not sampled, and grouped by thread: `main`, `tile_worker` (each tile
+worker opens its counters when it starts; the replay also names these threads `tile_worker`) and
+`other` (threads found at a phase start). `summary.json` has, per phase, medians over the runs of each
+event's total, `main_*` and `tile_worker_*` instructions and cycles, IPC, and the spread over runs
+(`*_range_pct`). `multiplexed` would mean the counters had to share hardware and are scaled estimates
+(not seen on the dev VM). A full run takes about 9 s.
+
+`--top N` also runs `perf record -F 499 -e cycles:u` and reports each phase's top N functions by self
+cycles, from the samples between the phase's CLOCK_MONOTONIC `t_start` and `t_end` (in `runN.json`;
+`perf.N.data` is kept for `perf report -i`, whose `--time` takes the same bounds). Keep the sampling
+rate low: on the dev VM perf interrupts are slow, and sampling at tens of kHz was throttled by the
+kernel (lowering `kernel.perf_event_max_sample_rate` until reboot), lost samples and inflated cycles.
+
+Needs `kernel.perf_event_paranoid` <= 2 and hardware counters (the dev VM has both).
+
+Use it while iterating, and callgrind to confirm before committing and for call counts. On the dev VM
+(5 runs, all phases): instructions per phase vary by 0.03% at most between runs, so a change of about
+0.1% shows in a single run. Per-phase instructions are 1-3% below callgrind's (startup 10.91G vs
+11.14G, zoom 21.97G vs 22.56G); compare perf with perf and callgrind with callgrind. Cycles per phase
+vary much more (max-min 3-20%, 49% for `idle`), so only large cycle changes are visible, and only over
+several runs each of A and B; per-phase wall time is noisier still.
+
+All three pass `--workers 1` by default (one tile worker thread); use `--workers N` to change it. Use
 `--phases a,b` to run and measure only some phases: the others are skipped, except the scene loads
 (`startup`, `terrain_load`) that later phases need. Each phase's setup moves the camera where it needs
 it, but tile caches start colder than in a full run, so only compare runs with the same `--phases`
@@ -199,12 +225,11 @@ vs 632), while a callgrind run was starting alongside. Not reproduced since; if 
   comparison only recompiles changed files; ccache (`CCACHE_BASEDIR`, plus `CCACHE_NOHASHDIR` for `-g`
   builds) and mold/lld would speed this up. For small focused changes, prefer a patch with a runtime
   switch (see Patches): no rebuild, and no noise from code layout.
-- **perf:** callgrind's instruction counts are the repeatable signal, but its cache model is simplistic and
-  it runs one thread at a time. `perf stat` / `perf record` modes for the replay and a flame-graph script
-  for the live app would confirm real-time gains and find cache, thread or driver costs. Hardware
-  counters aren't available in the dev VM yet; timer sampling works.
+- **perf call graphs:** `bench.py perf --top` has self costs only; `--call-graph fp` (the bench build has
+  frame pointers) would give inclusive costs and flame graphs per phase, and a flame-graph script for the
+  live app would find thread and driver costs. Precise (PEBS) events aren't available in the dev VM.
 - **Single-tile microbenchmark:** build one fixed tile from the fixture with the app's scene and split the
   cost by stage (MVT parse, style matching and JS functions, geometry building); quicker and more focused
   under callgrind than the replay. The removed upstream Google Benchmark suite had this shape. More
   generally, microbenchmarks only for hotspots the replay finds (for example `handleOcclusions` at
-  increasing label counts): nanobench if hardware counters work, otherwise Google Benchmark plus callgrind.
+  increasing label counts): nanobench (hardware counters work in the dev VM) or Google Benchmark plus callgrind.
