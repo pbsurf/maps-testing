@@ -1,6 +1,5 @@
 # Linux makefile for the tangram benchmark replay (testing/bench/README.md); run from the explore root
 # - make -f testing/bench.mk   builds build/Bench/replay
-# - TANGRAM_BENCH enables the counters in tangram-es/core/src/debug/benchCounters.h
 # - PROFILE=1 (default) keeps frame pointers and avoids AVX-512 for valgrind
 
 TARGET ?= replay
@@ -10,7 +9,7 @@ BUILDDIR ?= build/Bench
 
 include make/shared.mk
 
-DEFS += LOG_LEVEL=2 TANGRAM_BENCH
+DEFS += LOG_LEVEL=2
 
 ## modules
 include tangram-es/core/module.mk

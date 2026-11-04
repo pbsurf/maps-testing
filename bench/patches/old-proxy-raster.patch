@@ -1,0 +1,32 @@
+diff --git a/core/src/tile/tileManager.cpp b/core/src/tile/tileManager.cpp
+index c1a90a9c..898675d6 100644
+--- a/core/src/tile/tileManager.cpp
++++ b/core/src/tile/tileManager.cpp
+@@ -458,7 +458,26 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
+                     auto& rasters = entry.tile->rasters();
+                     size_t offset = rasters.size() - srcs.size();
+                     entry.numMissingRasters = 0;
+-                    for (size_t ii = 0; ii < srcs.size(); ++ii) {
++                    // BENCH patch old-proxy-raster: BENCH_OLD_PROXY_RASTER=1 switches to the code before cccd4277
++                    static const bool oldProxyRaster = getenv("BENCH_OLD_PROXY_RASTER") != nullptr;
++                    static bool logged = false;
++                    if (oldProxyRaster && !logged) { LOGW("BENCH_OLD_PROXY_RASTER: keep proxy rasters"); logged = true; }
++                    for (size_t ii = 0; ii < srcs.size() && oldProxyRaster; ++ii) {
++                        if (rasters[ii+offset].texture != srcs[ii]->emptyTexture()) { continue; }
++                        ++entry.numMissingRasters;
++                        TileID id(tileId.x, tileId.y, tileId.z);
++                        do {
++                            id = id.getParent();
++                            auto proxy = srcs[ii]->getTexture(id);
++                            if (proxy) {
++                                rasters[ii+offset].tileID = TileID(id.x, id.y, id.z, tileId.s);
++                                rasters[ii+offset].texture = proxy;
++                                --entry.numMissingRasters;
++                                break;
++                            }
++                        } while (id.z > 13 || (id.z > 0 && id.z + 2 >= tileId.z));
++                    }
++                    for (size_t ii = 0; ii < srcs.size() && !oldProxyRaster; ++ii) {
+                         auto& raster = rasters[ii+offset];
+                         TileID want = srcs[ii]->subTaskTileID(*_tileSet.source, tileId);
+                         bool missing = raster.texture == srcs[ii]->emptyTexture();

@@ -1,0 +1,24 @@
+diff --git a/core/src/tile/tileWorker.cpp b/core/src/tile/tileWorker.cpp
+index eb93b3a3..812e7116 100644
+--- a/core/src/tile/tileWorker.cpp
++++ b/core/src/tile/tileWorker.cpp
+@@ -93,7 +93,19 @@ void TileWorker::run(Worker* instance) {
+         if (task->isCanceled()) { continue; }
+ 
+         LOGTInit(">>> process %s %s", task->source()->name().c_str(), task->tileId().toString().c_str());
++        // BENCH patch build-cpu-log: BENCH_BUILD_LOG=FILE writes one line per task: source, tile, thread CPU
++        //  microseconds, and whether a tile was built (1) or not (0, e.g. missing data)
++        static FILE* buildLog = getenv("BENCH_BUILD_LOG") ? fopen(getenv("BENCH_BUILD_LOG"), "w") : nullptr;
++        timespec cpu0, cpu1;
++        if (buildLog) { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0); }
+         task->process(*builder);
++        if (buildLog) {
++            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1);
++            double us = (cpu1.tv_sec - cpu0.tv_sec)*1e6 + (cpu1.tv_nsec - cpu0.tv_nsec)*1e-3;
++            fprintf(buildLog, "%s %s %.0f %d\n", task->source()->name().c_str(),
++                    task->tileId().toString().c_str(), us, task->tile() ? 1 : 0);
++            fflush(buildLog);
++        }
+         LOGT("<<< process %s %s", task->source()->name().c_str(), task->tileId().toString().c_str());
+ 
+         m_platform.requestRender();

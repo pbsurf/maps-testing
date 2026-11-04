@@ -1,0 +1,27 @@
+diff --git a/core/src/labels/labelManager.cpp b/core/src/labels/labelManager.cpp
+index 47e44df3..f8b5c441 100644
+--- a/core/src/labels/labelManager.cpp
++++ b/core/src/labels/labelManager.cpp
+@@ -587,6 +587,22 @@ void LabelManager::updateLabelSet(const View& _view, float _dt, const Scene& _sc
+     // stable: labels that tie keep their priority order
+     std::stable_sort(m_labels.begin(), m_labels.end(), LabelManager::zOrderComparator);
+ 
++    // BENCH patch dump-labels: BENCH_DUMP_LABELS=FILE writes every label entry (tile, source, style, index in
++    //  draw order, state, priority, hash, screen position) after every update, to find where two runs diverge
++    static FILE* labelDump = getenv("BENCH_DUMP_LABELS") ? fopen(getenv("BENCH_DUMP_LABELS"), "w") : nullptr;
++    if (labelDump) {
++        fprintf(labelDump, "== frame %d\n", int(Scene::frameCount));
++        for (size_t i = 0; i < m_labels.size(); ++i) {
++            auto& e = m_labels[i];
++            glm::vec4 sc = e.label->screenCoord();
++            fprintf(labelDump, "%s src%d style%u idx%zu state%d occl%d prio%.3f hash%zx xy%.2f,%.2f\n",
++                    e.tile ? e.tile->getID().toString().c_str() : "marker", e.tile ? e.tile->sourceID() : -1,
++                    e.style ? e.style->getID() : 0u, i, int(e.label->state()), int(e.label->isOccluded()),
++                    e.priority, e.label->hash(), sc.x, sc.y);
++        }
++        fflush(labelDump);
++    }
++
+     Label::AABB screenBounds{0, 0, _viewState.viewportSize.x, _viewState.viewportSize.y};
+ 
+     auto* elevManager = _scene.elevationManager();

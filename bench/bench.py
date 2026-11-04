@@ -173,6 +173,46 @@ def parse_callgrind(path):
     return info
 
 
+# counters from call counts (callee regex, caller regex or None): exact, and tangram needs no counter code
+CALL_COUNTS = {
+    "tile_builds": (r"Tangram::TileBuilder::build\(", None),
+    "tile_requests": (r"loadTileData\(", r"Tangram::TileManager::loadTiles\("),
+    # the collision test callback passed to isect2d in handleOcclusions (a std::function, so not inlined)
+    "collision_candidates": (r"LabelManager::handleOcclusions.*_M_invoke\(", None),
+    # exact and proxy raster lookups for tiles without their exact raster (cccd4277)
+    "proxy_raster_lookups": (r"Tangram::RasterSource::getTexture\(", r"Tangram::TileManager::updateTileSet\("),
+}
+
+
+def call_counts(path):
+    """Sum the calls= lines of a callgrind dump for the callees (and callers) in CALL_COUNTS."""
+    names = {}
+    rx = {k: (re.compile(ce), re.compile(cr) if cr else None) for k, (ce, cr) in CALL_COUNTS.items()}
+    out = {k: 0 for k in CALL_COUNTS}
+    fn = cfn = ""
+
+    def name(spec):  # name compression: "(id) name" the first time, "(id)" after
+        m = re.match(r"\((\d+)\)(?: (.*))?", spec)
+        if not m:
+            return spec
+        if m.group(2):
+            names[m.group(1)] = m.group(2)
+        return names.get(m.group(1), "")
+
+    with open(path, errors="replace") as f:
+        for line in f:
+            if line.startswith("fn="):
+                fn = name(line[3:].strip())
+            elif line.startswith("cfn="):
+                cfn = name(line[4:].strip())
+            elif line.startswith("calls="):
+                n = int(line[6:].split()[0])
+                for k, (ce, cr) in rx.items():
+                    if ce.search(cfn) and (cr is None or cr.search(fn)):
+                        out[k] += n
+    return out
+
+
 # inclusive cost groups; main thread frame work is in bench_main_* (replay.cpp)
 COST_GROUPS = {
     "main_ir": r"bench_main_(frame|update|render|load_scene)\b",
@@ -196,13 +236,16 @@ def cmd_callgrind(args):
         if not m:
             continue  # final dump at program exit
         phases[m.group(1)] = {"total_ir": info["ir"], "main_ir": info["main_ir"],
-                              "tile_worker_ir": info["tile_worker_ir"], "file": info["file"]}
+                              "tile_worker_ir": info["tile_worker_ir"], **call_counts(path),
+                              "file": info["file"]}
     summary = {"run": res["run"], "fixture": fixture_info(args.fixture), "phases": phases}
     with open(os.path.join(args.out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"{'phase':16s} {'main Ir':>15s} {'tile worker Ir':>15s} {'total Ir':>15s}")
+    print(f"{'phase':16s} {'main Ir':>15s} {'tile worker Ir':>15s} {'total Ir':>15s} {'builds':>6s} "
+          f"{'collisions':>10s} {'proxy lookups':>13s}")
     for name, p in phases.items():
-        print(f"{name:16s} {p['main_ir']:>15,d} {p['tile_worker_ir']:>15,d} {p['total_ir']:>15,d}")
+        print(f"{name:16s} {p['main_ir']:>15,d} {p['tile_worker_ir']:>15,d} {p['total_ir']:>15,d} "
+              f"{p['tile_builds']:>6d} {p['collision_candidates']:>10d} {p['proxy_raster_lookups']:>13d}")
     misses = offline_check(res)
     if misses:
         print(f"WARNING: tiles missing from fixture: {misses}", file=sys.stderr)
@@ -265,7 +308,7 @@ def main():
             sp.add_argument("--resume", action="store_true", help="continue an incomplete fetch")
         if name in ("callgrind", "memory"):
             sp.add_argument("--out", required=True)
-            sp.add_argument("--phases", help="comma separated phases to measure (default: all)")
+            sp.add_argument("--phases", help="comma separated phases to run and measure (default: all; others are skipped except scene loads)")
             sp.add_argument("--stop-after", help="stop after this phase")
         if name == "memory":
             sp.add_argument("--runs", type=int, default=3)

@@ -1,5 +1,5 @@
 // Headless benchmark replay: loads the app's real scene against a fixed tile fixture, plays a scripted
-//  camera path over Paris in phases, and reports per-phase memory and counters as JSON.
+//  camera path over Paris in phases, and reports per-phase memory and GPU stats as JSON.
 // - links tangram core with the null GL driver in tests/src/gl_mock.cpp (no GPU or X server)
 // - every frame first waits until no tile task is being fetched or built, so the set of tiles each frame
 //   sees, and so the work done on every thread, is independent of thread timing
@@ -16,7 +16,6 @@
 #include "tile/tileManager.h"
 #include "util/asyncWorker.h"
 #include "util/elevationManager.h"
-#include "debug/benchCounters.h"
 
 #include "benchPlatform.h"
 #include "gl_mock.h"
@@ -56,7 +55,6 @@ void TANGRAM_WakeEventLoop() {}
 
 namespace Tangram {
 
-BenchCounters g_benchCounters;
 
 void logStr(const std::string& msg) { fputs(msg.c_str(), stderr); }
 void setCurrentThreadPriority(int priority) {}
@@ -90,6 +88,9 @@ extern "C" __attribute__((noinline)) void bench_main_load_scene(Map* map, SceneO
 namespace {
 
 constexpr float FRAME_DT = 1/60.0f;
+// time step while waiting for a view to complete: labels fade out over 1s (scene hide transitions), which
+//  would take 60 nearly identical frames at FRAME_DT
+constexpr float SETTLE_DT = 0.25f;
 
 struct Args {
     std::string assets = "assets";
@@ -219,8 +220,7 @@ public:
 
     // per-phase state
     uint64_t frames = 0;
-    int totalFrames = 0;  // over all phases, for BENCH_DUMP_LABELS
-    LabelManager::Stats labelPeak = {0, 0, 0};
+    size_t labelsPeak = 0;
     bool incomplete = false;
     bool failed = false;
     bool stopped = false;
@@ -238,7 +238,7 @@ public:
     void drain(const std::function<void(std::function<void()>)>& enqueue, const char* name);
     void setView(double lng, double lat, float zoom);
     bool tasksInFlight();
-    MapState frame();
+    MapState frame(float dt = FRAME_DT);
     void waitComplete(int maxFrames = 1200);
     void runFrames(int n, const std::function<void(float)>& step);
     void runPhase(const std::string& name, const std::function<void()>& setup,
@@ -347,10 +347,6 @@ bool Replay::loadScene(bool terrain3D, double lng, double lat, float zoom) {
         settle();
         bench_main_frame(map.get(), FRAME_DT);
         ++frames;
-        if (getenv("BENCH_VERBOSE")) {
-            LOG("loadScene frame: requests %d, builds %d", int(g_benchCounters.tileRequests),
-                int(g_benchCounters.tileBuilds.load()));
-        }
         if (map->getScene()->isReady()) { break; }
         if (nowSec(CLOCK_MONOTONIC) - t0 > args.settleTimeout) {
             auto* err = map->getScene()->errors();
@@ -419,16 +415,13 @@ void Replay::drain(const std::function<void(std::function<void()>)>& enqueue, co
 }
 
 void Replay::sampleLabels() {
-    auto s = map->getScene()->labelManager()->stats();
-    labelPeak.labels = std::max(labelPeak.labels, s.labels);
-    labelPeak.obbs = std::max(labelPeak.obbs, s.obbs);
-    labelPeak.obbLabelsCapacity = std::max(labelPeak.obbLabelsCapacity, s.obbLabelsCapacity);
+    labelsPeak = std::max(labelsPeak, map->getScene()->labelManager()->numLabels());
 }
 
-MapState Replay::frame() {
+MapState Replay::frame(float dt) {
     settle();
     MapState state;
-    state.flags = bench_main_update(map.get(), FRAME_DT);
+    state.flags = bench_main_update(map.get(), dt);
     // update() dispatches tile tasks; wait for them before render, otherwise how many new glyphs the
     //  glyph atlas upload in render picks up depends on worker timing. Results are only taken by the
     //  next update(), so this doesn't change what the frame shows.
@@ -436,13 +429,6 @@ MapState Replay::frame() {
     bench_main_render(map.get());
     ++frames;
     sampleLabels();
-    // BENCH_DUMP_LABELS=FILE: label entries after every frame, to find where two runs diverge
-    static FILE* labelDump = getenv("BENCH_DUMP_LABELS") ? fopen(getenv("BENCH_DUMP_LABELS"), "w") : nullptr;
-    if (labelDump) {
-        fprintf(labelDump, "== frame %d (%s)\n", totalFrames++, platform->phase().c_str());
-        map->getScene()->labelManager()->dumpLabels(labelDump);
-        fflush(labelDump);
-    }
     return state;
 }
 
@@ -453,13 +439,12 @@ void Replay::waitComplete(int maxFrames) {
     static bool verbose = getenv("BENCH_VERBOSE") != nullptr;
     int ncomplete = 0;
     for (int i = 0; i < maxFrames && !failed; ++i) {
-        MapState state = frame();
+        MapState state = frame(SETTLE_DT);
         if (verbose) {
-            LOG("waitComplete frame %d: flags %x, labels %d, tiles loading %d, visible %d, requests %d, builds %d",
-                i, state.flags, int(map->getScene()->labelManager()->stats().labels),
+            LOG("waitComplete frame %d: flags %x, labels %d, tiles loading %d, visible %d",
+                i, state.flags, int(map->getScene()->labelManager()->numLabels()),
                 map->getScene()->tileManager()->numLoadingTiles(),
-                int(map->getScene()->tileManager()->getVisibleTiles().size()),
-                int(g_benchCounters.tileRequests), int(g_benchCounters.tileBuilds.load()));
+                int(map->getScene()->tileManager()->getVisibleTiles().size()));
         }
         ncomplete = state.viewComplete() && !tasksInFlight() ? ncomplete + 1 : 0;
         if (ncomplete >= 2) { return; }
@@ -486,25 +471,23 @@ void Replay::runPhase(const std::string& name, const std::function<void()>& setu
     if (failed || stopped) { return; }
     if (name == args.stopAfter) { stopped = true; }
     bool measure = wantPhase(name);
+    bool isSceneLoad = name == "startup" || name == "terrain_load";
+    if (!measure && !args.fetch && !isSceneLoad) { return; }
     platform->setPhase(name);
-    // setup (camera jumps, settling) is not measured, but runs even for skipped phases so that later
-    //  phases start from the same state
+    // setup (camera jumps, settling) is not measured
     if (setup) { setup(); }
     if (!measure && !args.fetch) {
-        // skipped phase: still run it unmeasured so later phases see the same tile and label state
-        run();
+        // phases not requested with --phases are skipped, except the scene loads later phases need; each
+        //  phase's setup puts the camera where its run expects it, but tile caches start colder, so only
+        //  compare runs with the same --phases
+        if (isSceneLoad) { run(); }
         return;
     }
 
     LOG("=== Phase %s", name.c_str());
     frames = 0;
-    labelPeak = {0, 0, 0};
+    labelsPeak = 0;
     incomplete = false;
-    BenchCounters c0;
-    c0.collisionCandidates = g_benchCounters.collisionCandidates;
-    c0.proxyRasterLookups = g_benchCounters.proxyRasterLookups;
-    c0.tileRequests = g_benchCounters.tileRequests;
-    uint64_t builds0 = g_benchCounters.tileBuilds;
     uint64_t net0 = platform->networkRequests, netfail0 = platform->networkFailures;
     GLMockStats gl0 = glMockStats();
     glMockResetPeaks();
@@ -537,8 +520,6 @@ void Replay::runPhase(const std::string& name, const std::function<void()>& setu
         rasterTextures += n;
     }
     double nf = std::max(uint64_t(1), frames);
-    uint64_t candidates = g_benchCounters.collisionCandidates - c0.collisionCandidates;
-    uint64_t proxyLookups = g_benchCounters.proxyRasterLookups - c0.proxyRasterLookups;
 
     JsonObj r;
     r.add("phase", name)
@@ -570,19 +551,23 @@ void Replay::runPhase(const std::string& name, const std::function<void()>& setu
      .add("tile_cache_entries", double(tileMgr->getTileCache()->getNumEntries()))
      .add("raster_cache_bytes", double(rasterBytes))
      .add("raster_textures", double(rasterTextures))
-     .add("labels_peak", double(labelPeak.labels))
-     .add("obbs_peak", double(labelPeak.obbs))
-     .add("obb_labels_capacity", double(labelPeak.obbLabelsCapacity))
-     .add("collision_candidates", double(candidates))
-     .add("collision_candidates_per_frame", candidates/nf)
-     .add("proxy_raster_lookups", double(proxyLookups))
-     .add("proxy_raster_lookups_per_frame", proxyLookups/nf)
-     .add("tile_requests", double(g_benchCounters.tileRequests - c0.tileRequests))
-     .add("tile_builds", double(g_benchCounters.tileBuilds - builds0))
+     .add("labels_peak", double(labelsPeak))
      .add("network_requests", double(platform->networkRequests - net0));
     if (args.fetch) { r.add("network_failures", double(platform->networkFailures - netfail0)); }
     phaseResults.push_back(r.str("    "));
     LOG("=== Phase %s: %d frames, main thread CPU %.2fs", name.c_str(), int(frames), cpu);
+}
+
+// BENCH_* environment variables, e.g. switches added by patches from bench/patches, so results record them
+static std::string benchEnv() {
+    std::vector<std::string> vars;
+    for (char** e = environ; *e; ++e) {
+        if (strncmp(*e, "BENCH_", 6) == 0) { vars.push_back(*e); }
+    }
+    std::sort(vars.begin(), vars.end());
+    std::string out;
+    for (auto& v : vars) { out += (out.empty() ? "" : " ") + v; }
+    return out;
 }
 
 std::string Replay::headerJson() const {
@@ -595,11 +580,16 @@ std::string Replay::headerJson() const {
      .add("height", double(args.height))
      .add("pixel_scale", double(args.pixelScale))
      .add("valgrind", bool(RUNNING_ON_VALGRIND))
+     .add("bench_env", benchEnv())
+     .add("phases", [&]{ std::string p; for (auto& s : args.phases) { p += (p.empty() ? "" : ",") + s; } return p; }())
      .add("malloc_arena_max", getenv("MALLOC_ARENA_MAX") ? getenv("MALLOC_ARENA_MAX") : "");
     return h.str("  ");
 }
 
 // The Paris script. Positions: (lng, lat).
+// The tile cache only holds about one screen of tiles, so the script never returns to an area at a tile
+//  zoom level it has already built (that would measure the same tile builds again). Each frame waits for
+//  its tiles, so every frame's view is fully built: frames are only spent where they add new work.
 void Replay::run() {
     const double PARIS_LNG = 2.352, PARIS_LAT = 48.857;
 
@@ -607,74 +597,72 @@ void Replay::run() {
     auto panTo = [&](double lng0, double lat0, double lng1, double lat1, int n) {
         runFrames(n, [&](float t) { map->setPosition(lerp(lng0, lng1, t), lerp(lat0, lat1, t)); });
     };
-    auto zoomTo = [&](float z0, float z1, int n) {
-        runFrames(n, [&](float t) { map->setZoom(lerp(z0, z1, t)); });
-    };
 
-    // 1. startup and scene load, centered on Paris at z14
+    // 1. startup and scene load, centered on Paris at z14 (the z14 tiles cover about 13 x 8 km)
     runPhase("startup", nullptr, [&]() {
         if (!loadScene(false, PARIS_LNG, PARIS_LAT, 14)) { failed = true; return; }
         waitComplete();
     });
 
-    // 2. pan across central Paris at z15.5-16 (dense labels): west to east along the Seine, then south to
-    //  north from the Latin Quarter to Montmartre
-    runPhase("pan", nullptr, [&]() {
-        setView(2.2950, 48.8566, 15.5f);
-        waitComplete();
-        panTo(2.2950, 48.8566, 2.3950, 48.8566, 240);
-        waitComplete();
-        setView(2.3470, 48.8450, 16);
-        waitComplete();
-        panTo(2.3470, 48.8450, 2.3470, 48.8850, 240);
-        waitComplete();
-    });
-
-    // 3. zoom out to z10, then back in to z17
-    runPhase("zoom", nullptr, [&]() {
-        setView(PARIS_LNG, PARIS_LAT, 16);
-        zoomTo(16, 10, 180);
-        waitComplete();
-        zoomTo(10, 17, 210);
-        waitComplete();
-    });
-
-    // 5. idle: steady-state frames with nothing loading (2D, before switching to terrain mode)
-    runPhase("idle", [&]() {
-        setView(2.3376, 48.8606, 16);  // Louvre
+    // 2. pan west to east along the Seine through central Paris at z15.5 (dense labels: handleOcclusions),
+    //  about one view width (3.5 km), so the tiles and labels in view turn over once. The start view is
+    //  loaded in setup: only tiles brought in by panning are measured
+    const double PAN_LAT = 48.8566, PAN_LNG0 = 2.3150, PAN_LNG1 = 2.3636;
+    runPhase("pan", [&]() {
+        setView(PAN_LNG0, PAN_LAT, 15.5f);  // Concorde
         waitComplete();
     }, [&]() {
-        runFrames(300, [](float) {});
+        panTo(PAN_LNG0, PAN_LAT, PAN_LNG1, PAN_LAT, 30);  // to the Marais
+        waitComplete();
     });
 
-    // 4. rotate and tilt in 3D terrain mode; scene reload is measured separately
+    // 3. idle: steady-state frames with nothing loading, where pan ended (2D, before terrain mode)
+    runPhase("idle", [&]() {
+        setView(PAN_LNG1, PAN_LAT, 15.5f);  // no new tiles after pan
+        waitComplete();
+    }, [&]() {
+        runFrames(60, [](float) {});
+    });
+
+    // 4. zoom out from z17 to z10 north of Paris (Saint-Denis), clear of the tiles built by startup and
+    //  pan. Three frames per tile zoom level L, at L+0.9, L+0.7 and L+0.5: frames within a level show a
+    //  subset of the tiles at L+0.5, so this builds every level once at about half the tiles of a view at
+    //  L+0.0, which a continuous zoom would pass through
+    runPhase("zoom", nullptr, [&]() {
+        setView(2.3600, 48.9500, 17.9f);
+        for (int z = 17; z >= 10 && !failed; --z) {
+            for (float f : {0.9f, 0.7f, 0.5f}) {
+                map->setZoom(z + f);
+                frame();
+            }
+        }
+        waitComplete();
+    });
+
+    // 5. scene reload in 3D terrain mode
     runPhase("terrain_load", nullptr, [&]() {
         if (!loadScene(true, PARIS_LNG, PARIS_LAT, 15)) { failed = true; return; }
         waitComplete();
     });
 
+    // 6. tilt in terrain mode (Paris is flat: measures terrain overhead). No rotation: it only changes the
+    //  view matrix, but brings new tiles into view and makes tiles switch zoom levels (rebuilds)
     runPhase("terrain", nullptr, [&]() {
-        runFrames(180, [&](float t) {
-            map->setRotation(float(M_PI/2)*t);
-            map->setTilt(float(M_PI/3)*std::min(1.0f, t*1.5f));
-        });
-        waitComplete();
-        runFrames(120, [&](float t) { map->setRotation(float(M_PI/2)*(1 + t)); });
+        runFrames(10, [&](float t) { map->setTilt(float(M_PI/3)*t); });
         waitComplete();
     });
 
-    // 6. missing rasters: elevation tiles at z >= 14 for this area are deleted from the fixture (see
-    //  bench/fixture.py prune), so tiles use proxy rasters from the z12-13 elevation tiles loaded in setup
+    // 7. missing rasters: elevation tiles at z >= 14 for this area are deleted from the fixture (see
+    //  bench.py prune; only tiles no other phase uses), so tiles use proxy rasters from the z12-13
+    //  elevation tiles loaded in setup
     runPhase("missing_rasters", [&]() {
-        map->setRotation(0);
         map->setTilt(0);
-        setView(2.4350, 48.8350, 12.5f);  // Bois de Vincennes
+        setView(2.6000, 48.8500, 12.5f);  // about 18 km east, outside the area terrain's tilted view reaches
         waitComplete();
     }, [&]() {
-        zoomTo(12.5f, 15.5f, 120);
-        panTo(2.4350, 48.8350, 2.4450, 48.8380, 60);
+        map->setZoom(15);  // tiles find proxies (parent search)
         waitComplete();
-        runFrames(120, [](float) {});  // steady state on proxies
+        runFrames(10, [](float) {});  // steady state on proxies (per-frame exact raster lookups)
     });
 }
 
@@ -685,7 +673,7 @@ void usage() {
         "  --fetch            download missing tiles into the fixture (logs requests to DIR/requests.tsv)\n"
         "  --assets DIR       app assets directory (default: assets)\n"
         "  --out FILE         write JSON results to FILE (default: stdout)\n"
-        "  --phases A,B,...   only measure these phases (others still run, unmeasured)\n"
+        "  --phases A,B,...   only run and measure these phases (and the scene loads they need)\n"
         "  --stop-after PHASE stop after this phase\n"
         "  --source NAME      map source (default: sources.last_source in config.default.yaml)\n"
         "  --workers N        tile worker threads (default: 2)\n"
