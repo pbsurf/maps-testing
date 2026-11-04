@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Driver for the tangram benchmark replay (see README.md). Run from the explore repo root.
+"""Driver for the tangram benchmark replay (see README.md). Run from the styluslabs/maps root.
 
   bench.py fetch --fixture DIR      download a new fixture, prune it, verify offline, write its ID
   bench.py id --fixture DIR         print fixture ID (hash of tile IDs and data, not of the files)
@@ -43,7 +43,7 @@ WORKERS = "1"  # set from --workers
 
 def run_replay(fixture, extra, out_json, env=None, wrapper=None):
     if not os.path.exists(REPLAY):
-        die(f"{REPLAY} not found; build with: make -f testing/bench.mk (from the explore repo root)")
+        die(f"{REPLAY} not found; build with: make -f testing/bench.mk (from the styluslabs/maps root)")
     cmd = (wrapper or []) + [REPLAY, "--fixture", fixture, "--out", out_json, "--workers", WORKERS] + extra
     print("+", " ".join(cmd), file=sys.stderr)
     # the replay writes tile access times to the fixture's mbtiles files, so concurrent runs on one

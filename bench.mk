@@ -1,4 +1,4 @@
-# Linux makefile for the tangram benchmark replay (testing/bench/README.md); run from the explore root
+# Linux makefile for the tangram benchmark replay (testing/bench/README.md); run from the styluslabs/maps root
 # - make -f testing/bench.mk   builds build/Bench/replay
 # - PROFILE=1 (default) keeps frame pointers and avoids AVX-512 for valgrind
 

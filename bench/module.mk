@@ -1,4 +1,4 @@
-# Tangram benchmark replay (see README.md); built by testing/bench.mk from the explore root
+# Tangram benchmark replay (see README.md); built by testing/bench.mk from the styluslabs/maps root
 
 MAKE_BASE := $(GET_MAKE_BASE)
 

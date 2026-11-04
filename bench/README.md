@@ -1,12 +1,12 @@
 # Tangram benchmark replay
 
 Headless replay of the app's real scene over a fixed tile fixture, for catching CPU and memory
-regressions. The plan is in `~/maps/PROJECTS.md` ("Tangram benchmark harness"). It replaces the upstream
-Google Benchmark suite in `tangram-es/bench/`, which is no longer used.
+regressions. It replaces the upstream Google Benchmark suite in `tangram-es/bench/`, which is no longer
+used.
 
 ## Build
 
-From the `explore` root (all commands below assume it):
+From the root of the `styluslabs/maps` checkout (all commands below assume it):
 
     make -f testing/bench.mk -j2        # -> build/Bench/replay
 
@@ -19,9 +19,10 @@ valgrind and perf), and links:
 ## Fixture
 
 Tiles come from tiles.styluslabs.com (vector, source `osm`) and the ArcGIS elevation service (source
-`elevation`), cached in one mbtiles file per source in the fixture directory.
+`elevation`), cached in one mbtiles file per source in the fixture directory (`FIXTURE` below; keep it
+outside the repo).
 
-    testing/bench/bench.py fetch --fixture ~/maps/bench-fixture-2
+    testing/bench/bench.py fetch --fixture FIXTURE
 
 This plays the script online with the disk cache pointed at the fixture (logging every request with
 its phase to `requests.tsv`), deletes the z >= 14 elevation tiles used only by the `missing_rasters`
@@ -37,8 +38,8 @@ Elevation tiles keep their scene `max_age` (2 years); vector tiles never expire 
 
 ## Runs
 
-    testing/bench/bench.py callgrind --fixture ~/maps/bench-fixture-2 --out OUTDIR
-    testing/bench/bench.py memory --fixture ~/maps/bench-fixture-2 --out OUTDIR [--runs 3]
+    testing/bench/bench.py callgrind --fixture FIXTURE --out OUTDIR
+    testing/bench/bench.py memory --fixture FIXTURE --out OUTDIR [--runs 3]
 
 `callgrind` runs the replay under `valgrind --tool=callgrind`; each phase is zeroed and dumped
 separately (`CALLGRIND_DUMP_STATS_AT("<phase>")`), giving one file per phase (`callgrind.out.N`; the
