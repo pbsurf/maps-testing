@@ -157,3 +157,54 @@ A/B:
 For a new change, add a switch the same way: a `static const bool` from `getenv("BENCH_OLD_...")`
 guarding the old code path. Patches can stop applying as tangram changes; refresh them with
 `git diff > patches/NAME.patch` after fixing them up by hand.
+
+## Reference numbers
+
+Fixture `2d6050aafdf130c8` (165 vector and 269 elevation tiles, 36 elevation tiles pruned for
+`missing_rasters`), `--workers 1`, all phases, on the dev VM (2 vCPUs, i7-1165G7 host), 2026-11-04:
+- Measured phases: 161 frames and 501 tile builds. pan 35 frames / 26 builds, zoom 30 / 261, terrain
+  17 / 74, missing_rasters 13 / 8.
+- Callgrind: about 6 minutes for a full run, 53.6G Ir in total; startup takes about 1 minute and zoom
+  2.3 minutes; `--phases missing_rasters` alone takes under 2 minutes.
+- Native: main thread about 0.47 s, tile worker about 6.1 s, of which zoom's 110 mvt builds take about
+  2.1 s and startup's 40 about 1.4 s. Tile-worker CPU per build (`build-cpu-log.patch`): mvt 11-80 ms
+  depending on density (central Paris 70-80 ms), elevation about 0.3 ms (LERC decode), so elevation is
+  about 2% of tile-worker time despite more builds.
+
+A rare nondeterminism was seen once: 1 native run in about 50 had one GPU buffer fewer at startup (631
+vs 632), while a callgrind run was starting alongside. Not reproduced since; if it shows up again, diff
+`BENCH_DUMP_TEX` output from the two runs.
+
+## Possible extensions (not started)
+
+- **Results log and compare script.** An append-only `results.jsonl` (or SQLite) outside every repo, one
+  record per run: tangram commit plus a hash of uncommitted changes, fixture ID, phases, `bench_env`,
+  per-phase totals, top functions by inclusive and self cost, memory fields, counters, host and date. The
+  compare script pairs records with the same fixture ID and phases and prints per-phase deltas. It
+  compares deterministic fields exactly, and RSS and heap as a median of 3 runs, flagged above about 3-5%.
+  If the current fixture has no result for the base commit, it says so. Optional call graph via
+  `gprof2dot`. Today, comparing means diffing `summary.json` from two output directories.
+- **Automatic red flags:** functions whose calls per frame grow over `idle`; a DHAT pass on `idle` and
+  `pan` listing allocating call sites in per-frame paths; dense vs sparse views to catch costs that grow
+  much faster than tile or label count; tiles built twice, repeated requests; heap or GPU bytes rising
+  over `idle`.
+- **Loop test:** play the pan path, return to the start and play it again; heap and GPU bytes after the
+  second loop should match the first, within cache limits (more useful than LSan, since most memory is
+  freed at shutdown).
+- **Heap profiling:** Massif with per-phase snapshots via
+  `VALGRIND_MONITOR_COMMAND("detailed_snapshot <phase>.massif")`, the same pattern as the callgrind phase
+  dumps; heaptrack is faster but can't split by phase. More memory fields: `sqlite3_memory_used()` (mbtiles
+  cache) and the font atlas size.
+- **General A/B:** two persistent git worktrees (base and test) with their own build directories, so each
+  comparison only recompiles changed files; ccache (`CCACHE_BASEDIR`, plus `CCACHE_NOHASHDIR` for `-g`
+  builds) and mold/lld would speed this up. For small focused changes, prefer a patch with a runtime
+  switch (see Patches): no rebuild, and no noise from code layout.
+- **perf:** callgrind's instruction counts are the repeatable signal, but its cache model is simplistic and
+  it runs one thread at a time. `perf stat` / `perf record` modes for the replay and a flame-graph script
+  for the live app would confirm real-time gains and find cache, thread or driver costs. Hardware
+  counters aren't available in the dev VM yet; timer sampling works.
+- **Single-tile microbenchmark:** build one fixed tile from the fixture with the app's scene and split the
+  cost by stage (MVT parse, style matching and JS functions, geometry building); quicker and more focused
+  under callgrind than the replay. The removed upstream Google Benchmark suite had this shape. More
+  generally, microbenchmarks only for hotspots the replay finds (for example `handleOcclusions` at
+  increasing label counts): nanobench if hardware counters work, otherwise Google Benchmark plus callgrind.
