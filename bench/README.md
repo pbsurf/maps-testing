@@ -103,7 +103,7 @@ What makes this work:
 Waiting is excluded from callgrind's main-thread cost (it's outside the `bench_main_*` functions).
 
 Debugging tools for finding where two runs diverge (diff the files from two runs):
-- `BENCH_DUMP_LABELS=FILE`: every label entry after every frame (tile, style, seq, state, hash, screen
+- `BENCH_DUMP_LABELS=FILE`: every label entry after every frame (tile, style, index in draw order, state, hash, screen
   position)
 - `BENCH_DUMP_TEX=FILE`: every texture upload with its size and caller
 
