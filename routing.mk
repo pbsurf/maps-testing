@@ -17,9 +17,10 @@ MODULE_BASE := .
 
 MODULE_SOURCES = \
   testing/routing/routetest.cpp \
-  tangram-es/tests/src/gl_mock.cpp
+  tangram-es/tests/src/gl_mock.cpp \
+  tangram-es/tests/src/mockPlatform.cpp
 
-MODULE_INC_PRIVATE = tangram-es/tests/src
+MODULE_INC_PRIVATE = tangram-es/tests/src tangram-es/platforms/common/fontstash
 
 include $(ADD_MODULE)
 
