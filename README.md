@@ -1,6 +1,6 @@
 # Ascend Maps testing
 
-Tests and benchmarks for Ascend Maps (repo `styluslabs/maps-testing`, a submodule of `explore` at
+Tests and benchmarks for Ascend Maps (repo `pbsurf/maps-testing`, a submodule of `explore` at
 `testing/`). Everything here is built and run from the `explore` root.
 
 | folder | what | run |
